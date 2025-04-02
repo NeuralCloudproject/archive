@@ -146,39 +146,38 @@ def simulate_alpha_integration(N=16, samples=1000000, func='scalar', beta=5.8):
     print(f"Relative Error: {abs(paper_result - result) / paper_result * 100:.2f}%")
     return result, integral_err, paper_result
 
-# 격자 QCD: Wilson 루프 상관 함수 계산 (CUDA)
+# 격자 QCD: Wilson 루프 상관 함수 계산 (CUDA) - 시간 방향으로 수정
 @cuda.jit
 def wilson_loop_correlation(lattice, w_values, N, t_max):
     idx = cuda.grid(1)
-    if idx < N * N * N * t_max:
-        t_idx = idx % t_max
-        flat_idx = idx // t_max
-        z = flat_idx % N
-        flat_idx //= N
-        y = flat_idx % N
-        x = flat_idx // N
+    if idx < N * N * N:
+        z = idx % N
+        idx //= N
+        y = idx % N
+        x = idx // N
         
-        # 4x4 공간 루프 (x 방향)
-        loop = cuda.local.array((3, 3), dtype=complex128)
-        for i in range(3):
-            for j in range(3):
-                loop[i, j] = 1.0 if i == j else 0.0
-        
-        temp = cuda.local.array((3, 3), dtype=complex128)
-        for i in range(4):
-            for m in range(3):
-                for n in range(3):
-                    temp[m, n] = 0.0
-                    for k in range(3):
-                        temp[m, n] += loop[m, k] * lattice[(x+i)%N, y, z, t_idx, 0, k, n]
-            for m in range(3):
-                for n in range(3):
-                    loop[m, n] = temp[m, n]
-        
-        trace = 0.0
-        for i in range(3):
-            trace += loop[i, i].real
-        w_values[idx] = trace / 3
+        for t in range(t_max):
+            # 4x4 공간 루프 (x 방향)
+            loop = cuda.local.array((3, 3), dtype=complex128)
+            for i in range(3):
+                for j in range(3):
+                    loop[i, j] = 1.0 if i == j else 0.0
+            
+            temp = cuda.local.array((3, 3), dtype=complex128)
+            for i in range(4):
+                for m in range(3):
+                    for n in range(3):
+                        temp[m, n] = 0.0
+                        for k in range(3):
+                            temp[m, n] += loop[m, k] * lattice[(x+i)%N, y, z, (t)%N, 0, k, n]
+                for m in range(3):
+                    for n in range(3):
+                        loop[m, n] = temp[m, n]
+            
+            trace = 0.0
+            for i in range(3):
+                trace += loop[i, i].real
+            w_values[idx * t_max + t] = trace / 3
 
 # 부트스트랩으로 오차 계산
 def bootstrap_error(data, n_resamples=1000):
@@ -198,10 +197,10 @@ def simulate_mass_gap(N=16, steps=20000, samples=1000, t_max=32, beta=5.8, paper
     lattice = initialize_lattice(N)
     lattice = thermalize_lattice(lattice, beta=beta, steps=steps, N=N)
     
-    total_threads = N * N * N * t_max
+    total_threads = N * N * N
     threads_per_block = 256
     blocks_per_grid = (total_threads + (threads_per_block - 1)) // threads_per_block
-    w_values = cuda.device_array(total_threads, dtype=np.float64)
+    w_values = cuda.device_array(total_threads * t_max, dtype=np.float64)
     
     wilson_loop_correlation[blocks_per_grid, threads_per_block](lattice, w_values, N, t_max)
     cuda.synchronize()
@@ -212,6 +211,8 @@ def simulate_mass_gap(N=16, steps=20000, samples=1000, t_max=32, beta=5.8, paper
         w_t = w_values_host[t::t_max]
         correlation[t] = np.mean(w_t)
     
+    # 상관 함수 클리핑 (비정상 값 제거)
+    correlation = np.clip(correlation, -1e10, 1e10)
     t = np.arange(t_max)
     try:
         popt, pcov = curve_fit(exp_fit, t[1:], correlation[1:], p0=[0.8, 0.05], maxfev=10000)
